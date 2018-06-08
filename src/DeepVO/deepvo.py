@@ -1,4 +1,3 @@
-# Code Skeleton - Inspired by Tensoflow RNN tutorial: ptb_word_lm.py
 import os
 import sys
 import numpy as np
@@ -9,14 +8,28 @@ import warnings
 import argparse
 sys.path.append('fn2/')
 
-parser = argparse.ArgumentParser(description='Directory to save model')
+parser = ArgumentParser('Train the DeepVO model')
 parser.add_argument('--model_dir', action="store", dest="model_dir", default='./model_dir')
 parser.add_argument('--with_gpu', action="store_true", dest="with_gpu", default=False)
 parser.add_argument('--without_angles', action="store_true", dest="only_position", default=False)
 parser.add_argument('--use_pretrained_cnn', action="store_true", dest="use_pretrained_cnn", default=False)
 parser.add_argument('--start_testing', action="store_true", dest="test_flag", default=False)
+parser.add_argument('--dataset', type=str, required=True, help='Path to dataset folder')
+parser.add_argument('--optimizer', required=True, type=str, choices=tf_optimizers, help='Optimization algorithm')
+parser.add_argument('--learning-rate', required=True, type=float, help='Learning rate for the optimizer')
+parser.add_argument('--batch-size', required=True, type=int, help='Batch size')
+parser.add_argument('--epochs', required=True, type=int, help='Number of epochs')
+parser.add_argument('--flownet', required=False, type=str, default=None, help='Path to pretrained flownet weights')
+parser.add_argument('--memory-size', required=True, type=int, help='Size of the lstm cell memory')
+parser.add_argument('--sequence-length', required=True, type=int, help='Length of the sequences used for training the RNN.')
+parser.add_argument('--use-dropout', action='store_true', default=False, help='Use dropout (during training)')
+parser.add_argument('--visualize-displacement', action='store_true', default=False, help='Plot the percentage of translational and rotational displacement')
+parser.add_argument('--width', type=int, required=False, default=0, help='Resize images to long edge')
+parser.add_argument('--load-checkpoint', action='store_true', default=False, help='Load checkpoint from checkpoints/deepvo.ckpt')
+
 FLAGS = parser.parse_args()
-""" Hyper Parameters for learning"""
+
+""" Hyperparameters"""
 LEARNING_RATE = 0.0005
 BATCH_SIZE = 1
 LSTM_HIDDEN_SIZE = 550
@@ -30,6 +43,31 @@ if FLAGS.with_gpu:
     import src.flownet_s.flownet_s as fns
     from src.training_schedules import LONG_SCHEDULE
     Mode = fns.Mode
+
+def rcnn_module(config, input_, sess):
+    """ CNN layers connected to RNN which connects to final output """
+
+    # create 2 LSTMCells
+    rnn_layers = [tf.nn.rnn_cell.LSTMCell(size) for size in [config.hidden_size, config.hidden_size]]
+    multi_rnn_cell = tf.nn.rnn_cell.MultiRNNCell(rnn_layers)
+
+    rnn_inputs = []
+    reuse = None
+    for stacked_img in input_:
+        if FLAGS.use_pretrained_cnn:
+            rnn_inputs.append(get_optical_flow(stacked_img, reuse=reuse))
+        else:
+            rnn_inputs.append(cnn_layers(stacked_img, reuse=reuse))
+        reuse = True
+    # Flattening the final convolution layers to feed them into RNN
+    rnn_inputs = [tf.reshape(rnn_inputs[i],[-1, 20*6*1024]) for i in range(len(rnn_inputs))]
+    assert rnn_inputs[0].shape == (config.batch_size, 20*6*1024)
+
+    outputs, state = tf.nn.static_rnn(cell=multi_rnn_cell,
+                                       inputs=rnn_inputs,
+                                       dtype=tf.float32)
+    return outputs, state
+
 
 def isRotationMatrix(R):
     """ Checks if a matrix is a valid rotation matrix
@@ -60,43 +98,6 @@ def rotationMatrixToEulerAngles(R):
 
     return np.array([x, y, z])
 
-def build_rcnn_graph(config, input_, sess):
-    """ CNN layers connected to RNN which connects to final output """
-
-    # create 2 LSTMCells
-    rnn_layers = [tf.nn.rnn_cell.LSTMCell(size) for size in [config.hidden_size, config.hidden_size]]
-
-    # create a RNN cell composed sequentially of a number of RNNCells
-    multi_rnn_cell = tf.nn.rnn_cell.MultiRNNCell(rnn_layers)
-
-    rnn_inputs = []
-    reuse = None
-    for stacked_img in input_:
-        if FLAGS.use_pretrained_cnn:
-            rnn_inputs.append(get_optical_flow(stacked_img, reuse=reuse))
-        else:
-            rnn_inputs.append(cnn_layers(stacked_img, reuse=reuse))
-        reuse = True
-    # Flattening the final convolution layers to feed them into RNN
-    rnn_inputs = [tf.reshape(rnn_inputs[i],[-1, 20*6*1024]) for i in range(len(rnn_inputs))]
-    assert rnn_inputs[0].shape == (config.batch_size, 20*6*1024)
-
-    #max_time = len(rnn_inputs)
-
-    #rnn_inputs = tf.convert_to_tensor(rnn_inputs)
-    #tf.summary.histogram('final_cnn_layer_activations', rnn_inputs)
-
-    #config._initial_state = config.get_initial_state()
-    # 'outputs' is a tensor of shape [batch_size, max_time, 1000]
-    # 'state' is a N-tuple where N is the number of LSTMCells containing a
-    # tf.contrib.rnn.LSTMStateTuple for each cell
-    outputs, state = tf.nn.static_rnn(cell=multi_rnn_cell,
-                                       inputs=rnn_inputs,
-                                       dtype=tf.float32)
-    # Tensor shaped: [batch_size, max_time, cell.output_size]
-    #outputs = tf.unstack(outputs, max_time, axis=1)
-    assert outputs[0].shape == (config.batch_size, config.hidden_size)
-    return outputs, state
 
 def get_ground_6d_poses(p):
     """ For 6dof pose representaion """
@@ -224,7 +225,7 @@ def get_optical_flow(input_layer, reuse = None, sess=None):
     return output
 
 # Dataset Class
-class Kitty(object):
+class DrivePA(object):
     """ Class for manipulating Dataset"""
     def __init__(self, config, data_dir='../dataset/', isTraining=True):
         self._config = config
@@ -363,7 +364,7 @@ def inference():
         # configuration
         config_proto = tf.ConfigProto(device_count = {'GPU': 0})
         sess = tf.Session(config=config_proto)
-        kitty_data = Kitty(config)
+        PA_data = DrivePA(config)
         """ input_batch must be in shape of [?, TIME_STEPS, 384, 1280, 6] """
         #tf.reset_default_graph()
         print('Restoring Entire Session from checkpoint : %s'%MODEL_DIR+"model.meta")
@@ -380,8 +381,8 @@ def inference():
         poses.append(tf.get_default_graph().get_tensor_by_name("Wx_plus_b/xw_plus_b_2:0"))
         poses.append(tf.get_default_graph().get_tensor_by_name("Wx_plus_b/xw_plus_b_3:0"))
         poses.append(tf.get_default_graph().get_tensor_by_name("Wx_plus_b/xw_plus_b_4:0"))
-        while kitty_data._current_train_epoch < 1:
-            input_, ground_truth_batch, img_path_batch = kitty_data.get_next_batch(isTraining=False)
+        while PA_data._current_train_epoch < 1:
+            input_, ground_truth_batch, img_path_batch = PA_data.get_next_batch(isTraining=False)
             print (img_path_batch) 
             output = sess.run(poses, feed_dict={input_data:input_})
 	    print(len(output))
@@ -401,7 +402,7 @@ def main():
     config = Config(lstm_hidden_size=LSTM_HIDDEN_SIZE, lstm_num_layers=LSTM_NUM_LAYERS,
             time_steps=TIME_STEPS, num_steps=NUM_TRAIN_STEPS, batch_size=BATCH_SIZE, only_position=FLAGS.only_position)
     # configuration
-    kitty_data = Kitty(config)
+    PA_data = DrivePa(config)
     if FLAGS.with_gpu:
         sess = tf.Session()
     else:
@@ -450,7 +451,7 @@ def main():
         # Building the RCNN Network which
         # which returns the time series of output layers
         with tf.name_scope('RCNN'):
-            (outputs, _)  = build_rcnn_graph(config, input_, sess=sess)
+            (outputs, _)  = rcnn_module(config, input_, sess=sess)
         if FLAGS.use_pretrained_cnn:
             # Restoring FlowNetS variables
             var_list = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='FlowNetS')
@@ -503,18 +504,18 @@ def main():
     # Training and Testing Loop
     #for i in range(global_step, global_step + config.num_steps):
     i = 0
-    while kitty_data._current_train_epoch < 5:
-        print(kitty_data._current_train_epoch)
+    while PA_data._current_train_epoch < 5:
+        print(PA_data._current_train_epoch)
         print('step : %d'%i)
         if i % 10 == 0:  # Record summaries and test-set accuracy
-            batch_x, batch_y = kitty_data.get_next_batch(isTraining=False)
+            batch_x, batch_y = PA_data.get_next_batch(isTraining=False)
             print batch_y
             summary, acc = sess.run(
                     [merged, loss_op], feed_dict={input_data:batch_x, labels_:batch_y})
             test_writer.add_summary(summary, i)
             print('Accuracy at step %s: %s' % (i, acc))
         else:  # Record train set summaries, and train
-            batch_x, batch_y = kitty_data.get_next_batch(isTraining=True)
+            batch_x, batch_y = PA_data.get_next_batch(isTraining=True)
             summary, _ = sess.run(
                 [merged, train_op], feed_dict={input_data:batch_x, labels_:batch_y})
             train_writer.add_summary(summary, i)
@@ -523,8 +524,8 @@ def main():
             print('Train_error at step %s: %s' % (i, train_loss))
         i += 1
     save_path = saver.save(sess, MODEL_DIR + 'model')
-    print("Model saved in file: %s" % save_path)
-    print("epochs trained: " + str(kitty_data._current_train_epoch))
+    print("Model saved in file:PA% save_path)
+    print("epochs trained: " + str(PA_data._current_train_epoch))
     train_writer.close()
     test_writer.close()
 
@@ -534,21 +535,3 @@ if __name__ == "__main__":
         inference()
     else:    
         main()
-
-    """
-    print find_global_step()
-    # Test Code for checking feeding mechanism
-    config = Config(lstm_hidden_size=LSTM_HIDDEN_SIZE, lstm_num_layers=LSTM_NUM_LAYERS,
-            time_steps=TIME_STEPS, num_steps=NUM_TRAIN_STEPS, batch_size=BATCH_SIZE)
-    kitty_data = Kitty(config)
-    for i in range(config.num_steps):
-        batch_x, batch_y = kitty_data.get_next_batch(isTraining=False)
-        height, width, channels = 376, 1241, 2
-    print('epochs: %d'%kitty_data._current_train_epoch)
-    with tf.name_scope('input'):
-        input_data = tf.placeholder(tf.float32, [config.time_steps, None, height, width, channels])
-        # placeholder for labels
-        labels_ = tf.placeholder(tf.float32, [config.time_steps, None, 3])
-    with tf.Session() as sess:
-        sess.run([input_data, labels_], feed_dict={input_data:batch_x, labels_:batch_y})
-    """

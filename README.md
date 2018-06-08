@@ -21,6 +21,7 @@ and will publish the following topics:
 ```
 /vo/mono/odom   - odometry message 
 /vo/mono/image  - image message with detected features
+```
 
 to run the deepvo:
 ```
